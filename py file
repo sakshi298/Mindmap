@@ -1,0 +1,181 @@
+import openai
+import json
+import re
+from PIL import Image, ImageDraw, ImageFont
+import streamlit as st
+from jsonschema import validate, ValidationError
+from io import BytesIO
+
+def generate_mindmap_json(prompt, openai_api_key):
+    """Generates mindmap JSON from a prompt using OpenAI."""
+    openai.api_key = openai_api_key
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a mindmap generator. The JSON MUST have a single root node called 'Mindmap'. 'Mindmap' MUST be an object. Each object within the mindmap MUST have a 'text' key with a non-empty string value. Objects can optionally have a 'children' list, which contains more objects. Example node: {\"text\": \"Example Text\"}. Return ONLY valid JSON."
+                },
+                {
+                    "role": "user",
+                    "content": f"Generate a mindmap based on: {prompt}"
+                }
+            ],
+            temperature=0.7,
+        )
+        content = response.choices[0].message['content'].strip()
+        if not content:
+            st.error("OpenAI returned an empty response.")
+            return None
+        st.write(f"Raw JSON from OpenAI: {content}")
+        try:
+            mindmap_data = json.loads(content)
+            st.write(f"Parsed JSON: {mindmap_data}")
+            schema = {
+                "type": "object",
+                "properties": {
+                    "Mindmap": {"type": "object"}
+                },
+                "required": ["Mindmap"]
+            }
+            try:
+                validate(instance=mindmap_data, schema=schema)
+            except ValidationError as e:
+                st.error(f"Invalid Mindmap data structure: {e.message}")
+                return None
+            except Exception as e:
+                st.error(f"Error during json schema validation. {e}")
+                return None
+            return mindmap_data
+        except json.JSONDecodeError as e:
+            fixed_content = re.sub(r',\s*}', '}', content)
+            fixed_content = re.sub(r',\s*]', ']', fixed_content)
+            try:
+                mindmap_data = json.loads(fixed_content)
+                try:
+                    validate(instance=mindmap_data, schema=schema)
+                except ValidationError as e:
+                    st.error(f"Invalid Mindmap data structure after fix: {e.message}")
+                    return None
+                except Exception as e:
+                    st.error(f"Error during json schema validation after fix: {e}")
+                    return None
+                return mindmap_data
+            except json.JSONDecodeError:
+                st.write(f"JSONDecodeError: {e}")
+                st.write(f"Content causing error: {content}")
+                return None
+    except openai.error.OpenAIError as e:
+        st.error(f"OpenAI API Error: {e}")
+        return None
+    except Exception as e:
+        st.error(f"Error processing prompt: {e}")
+        return None
+
+def draw_mindmap(mindmap_data, image_width=1200, image_height=800):
+    """Draws a mindmap image from JSON data with improved layout and styling."""
+    if not mindmap_data:
+        return None
+
+    img = Image.new("RGB", (image_width, image_height), "white")
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("arial.ttf", 16)
+    except OSError:
+        font = ImageFont.load_default()
+
+    node_colors = ["#ADD8E6", "#90EE90", "#FFFFE0", "#F0E68C", "#E0FFFF"]  # Light colors
+    max_recursion_depth = 10  # Set a maximum recursion depth
+
+    def wrap_text(text, max_width, font):
+        """Wraps text to fit within a maximum width."""
+        words = text.split()
+        lines = []
+        current_line = ""
+        for word in words:
+            test_line = current_line + " " + word if current_line else word
+            bbox = draw.textbbox((0, 0), test_line, font=font)
+            if bbox[2] - bbox[0] <= max_width:
+                current_line = test_line
+            else:
+                lines.append(current_line)
+                current_line = word
+        lines.append(current_line)
+        return lines
+
+    def draw_node(node, x, y, level, parent_x=None, parent_y=None):
+        nonlocal max_recursion_depth  # Allow modification of outer scope variable
+        if level > max_recursion_depth:
+            st.error("Maximum recursion depth reached. Mindmap structure may be problematic.")
+            return  # Prevent further recursion
+
+        text = node.get("text")
+        if not isinstance(text, str) or not text:
+            text = "Missing/Invalid Text"
+
+        try:
+            wrapped_lines = wrap_text(text, 150, font)  # Wrap text to 150 pixels width
+            line_height = font.getbbox("Ay")[3] - font.getbbox("Ay")[1]
+            text_height = len(wrapped_lines) * line_height
+            max_line_width = 0
+            for line in wrapped_lines:
+                bbox = draw.textbbox((0, 0), line, font=font)
+                max_line_width = max(max_line_width, bbox[2] - bbox[0])
+            text_width = max_line_width
+
+            node_width = text_width + 30
+            node_height = text_height + 20
+            x -= node_width // 2
+            y -= node_height // 2
+
+            color = node_colors[level % len(node_colors)]  # Cycle through colors
+            draw.rounded_rectangle([x, y, x + node_width, y + node_height], radius=10, fill=color, outline="black")
+
+            text_y = y + 10
+            for line in wrapped_lines:
+                line_width = draw.textbbox((0, 0), line, font=font)[2] - draw.textbbox((0, 0), line, font=font)[0]
+                draw.text((x + (node_width - line_width) // 2, text_y), line, fill="black", font=font)
+                text_y += line_height
+
+            if parent_x is not None and parent_y is not None:
+                draw.line([(parent_x, parent_y), (x + node_width // 2, y + node_height // 2)], fill="black", width=2)
+
+            children = node.get("children", [])
+            if children:
+                num_children = len(children)
+                child_spacing = 200  # Increased spacing
+                start_x = x + node_width // 2 - (num_children - 1) * child_spacing // 2
+                child_y = y + node_height + 80  # Increased vertical spacing
+                for child in children:
+                    draw_node(child, start_x, child_y, level + 1, x + node_width // 2, y + node_height // 2)
+                    start_x += child_spacing
+
+        except Exception as e:
+            st.error(f"Error drawing node: {e}")
+            return  # Return here to prevent further drawing in case of error
+
+    root_node = mindmap_data.get("Mindmap", {})
+    draw_node(root_node, image_width // 2, 100, 0)
+
+    return img
+
+def main():
+    st.title("Mindmap Generator (OpenAI API)")
+    openai_api_key = st.text_input("Enter your OpenAI API Key:", type="password")
+    prompt_input = st.text_area("Enter prompt:")
+
+    if st.button("Generate Mindmap"):
+        if openai_api_key and prompt_input:
+            st.write("Generating mindmap...")
+            mindmap_data = generate_mindmap_json(prompt_input, openai_api_key)
+            if mindmap_data:
+                img = draw_mindmap(mindmap_data)
+                if img:
+                    st.image(img, caption=f"Mindmap for: {prompt_input}", use_column_width=True)
+                    buffered = BytesIO()
+                    img.save(buffered, format="PNG")
+                    
+
+if __name__ == "__main__":
+    main()
